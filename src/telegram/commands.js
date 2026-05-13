@@ -255,7 +255,13 @@ export function setupTelegram() {
 
   bot.on('callback_query', query => handleCallback(query).catch(err => console.log(`[callback] ${err.message}`)));
   bot.on('message', msg => handleMessage(msg).catch(err => console.log(`[message] ${err.message}`)));
-  bot.on('polling_error', err => console.log(`[telegram] polling ${err.message}`));
+  bot.on('polling_error', err => {
+    console.log(`[telegram] polling ${err.message}`);
+    if (err.code === 'EFATAL') {
+      console.log('[telegram] EFATAL — restarting polling in 5s');
+      setTimeout(() => bot.startPolling().catch(e => console.log(`[telegram] restart failed: ${e.message}`)), 5000);
+    }
+  });
 }
 
 async function sendMenu(chatId = TELEGRAM_CHAT_ID) {
