@@ -1,0 +1,10 @@
+.env
+.env.*
+node_modules/
+.git/
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.log
+.claude/
