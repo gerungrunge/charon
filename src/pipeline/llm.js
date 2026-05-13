@@ -57,7 +57,6 @@ export function compactCandidateForLlm(row) {
         distanceFromHighPercent: athWindow.belowHighPercent,
         aboveLowPercent: athWindow.aboveLowPercent,
       } : null,
-      windows: c.chart?.windows,
     },
     savedWalletExposure: c.savedWalletExposure,
     twitterNarrative: c.twitterNarrative,
