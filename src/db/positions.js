@@ -1,6 +1,7 @@
 import { db } from './connection.js';
 import { now, json } from '../utils.js';
 import { numSetting, boolSetting, setting, activeStrategy } from './settings.js';
+import { TRADING_MODE as ENV_TRADING_MODE } from '../config.js';
 
 export function openPositions() {
   return db.prepare('SELECT * FROM dry_run_positions WHERE status = ? ORDER BY opened_at_ms DESC').all('open');
@@ -18,8 +19,11 @@ export function canOpenMorePositions() {
 }
 
 export function tradingMode() {
+  // .env TRADING_MODE always wins over SQLite
+  const valid = ['dry_run', 'confirm', 'live'];
+  if (ENV_TRADING_MODE && valid.includes(ENV_TRADING_MODE)) return ENV_TRADING_MODE;
   const mode = setting('trading_mode', 'dry_run');
-  return ['dry_run', 'confirm', 'live'].includes(mode) ? mode : 'dry_run';
+  return valid.includes(mode) ? mode : 'dry_run';
 }
 
 export function allPositions(limit = 10) {
