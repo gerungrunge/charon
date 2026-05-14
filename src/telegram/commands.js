@@ -1,7 +1,7 @@
 import { bot } from './bot.js';
 import { TELEGRAM_CHAT_ID } from '../config.js';
 import { now, json } from '../utils.js';
-import { escapeHtml, fmtPct } from '../format.js';
+import { escapeHtml, fmtPct, fmtSol } from '../format.js';
 import { db } from '../db/connection.js';
 import { numSetting, boolSetting, setSetting, activeStrategy, setActiveStrategy, strategyById, updateStrategyConfig } from '../db/settings.js';
 import { candidateById, latestCandidateByMint, updateCandidateStatus } from '../db/candidates.js';
@@ -275,25 +275,57 @@ async function sendMenu(chatId = TELEGRAM_CHAT_ID) {
 }
 
 async function sendPnl(chatId, query = null) {
+  const sections = [];
+
+  // --- Dry-run / sim PnL ---
+  const allPos = db.prepare('SELECT * FROM dry_run_positions ORDER BY opened_at_ms DESC').all();
+  const openPos = allPos.filter(p => p.status === 'open');
+  const closedPos = allPos.filter(p => p.status === 'closed');
+  const wins = closedPos.filter(p => Number(p.pnl_percent || 0) > 0);
+  const losses = closedPos.filter(p => Number(p.pnl_percent || 0) < 0);
+  const totalPnlSol = closedPos.reduce((s, p) => s + Number(p.pnl_sol || 0), 0);
+  const totalPnlPct = closedPos.reduce((s, p) => s + Number(p.pnl_percent || 0), 0);
+  const avgPnlPct = closedPos.length ? totalPnlPct / closedPos.length : 0;
+  const winRate = closedPos.length ? (wins.length / closedPos.length * 100) : 0;
+
+  const best = [...closedPos].sort((a, b) => Number(b.pnl_percent || 0) - Number(a.pnl_percent || 0))[0];
+  const worst = [...closedPos].sort((a, b) => Number(a.pnl_percent || 0) - Number(b.pnl_percent || 0))[0];
+
+  const simLines = [
+    '📊 <b>Dry-Run PnL</b>',
+    '',
+    `Open: <b>${openPos.length}</b> · Closed: <b>${closedPos.length}</b>`,
+    `Wins: <b>${wins.length}</b> · Losses: <b>${losses.length}</b> · Win rate: <b>${fmtPct(winRate)}</b>`,
+    `Total PnL: <b>${totalPnlSol >= 0 ? '+' : ''}${fmtSol(totalPnlSol)} SOL</b> (${fmtPct(totalPnlPct)})`,
+    `Avg PnL/trade: <b>${fmtPct(avgPnlPct)}</b>`,
+  ];
+  if (best) simLines.push(`Best: <b>${escapeHtml(best.symbol || best.mint?.slice(0, 8))}</b> ${fmtPct(best.pnl_percent)}`);
+  if (worst && worst !== best) simLines.push(`Worst: <b>${escapeHtml(worst.symbol || worst.mint?.slice(0, 8))}</b> ${fmtPct(worst.pnl_percent)}`);
+  if (!allPos.length) simLines.push('\n<i>No dry-run positions yet.</i>');
+  sections.push(simLines.join('\n'));
+
+  // --- On-chain wallet PnL ---
   const wallets = savedWallets();
-  if (!wallets.length) {
-    const text = '📊 <b>PnL</b>\n\nNo saved wallets. Use /walletadd &lt;label&gt; &lt;address&gt;.';
-    return query ? editMenuMessage(query, text, navKeyboard()) : bot.sendMessage(chatId, text, { parse_mode: 'HTML' });
-  }
-  const chunks = [];
-  for (const wallet of wallets) {
-    const pnl = await fetchWalletPnl(wallet.address).catch(() => null);
-    if (!pnl) {
-      chunks.push(`• <b>${escapeHtml(wallet.label)}</b>: no data`);
-      continue;
+  if (wallets.length) {
+    const walletLines = ['', '👛 <b>Wallet PnL</b>'];
+    for (const wallet of wallets) {
+      const pnl = await fetchWalletPnl(wallet.address).catch(() => null);
+      if (!pnl) {
+        walletLines.push(`• <b>${escapeHtml(wallet.label)}</b>: no data`);
+        continue;
+      }
+      walletLines.push([
+        `• <b>${escapeHtml(wallet.label)}</b>`,
+        `  Win: ${fmtPct(pnl.winRate)} · PnL: ${fmtPct(pnl.totalPnlPercent)}`,
+        `  Trades: ${pnl.totalTrades} · Wins: ${pnl.wins}`,
+      ].join('\n'));
     }
-    chunks.push([
-      `• <b>${escapeHtml(wallet.label)}</b>`,
-      `Win: ${fmtPct(pnl.winRate)} · PnL: ${fmtPct(pnl.totalPnlPercent)}`,
-      `Trades: ${pnl.totalTrades} · Wins: ${pnl.wins}`,
-    ].join('\n'));
+    sections.push(walletLines.join('\n'));
+  } else {
+    sections.push('\n<i>💡 Tip: /walletadd &lt;label&gt; &lt;address&gt; to track on-chain PnL</i>');
   }
-  const text = `📊 <b>PnL</b>\n\n${chunks.join('\n\n')}`;
+
+  const text = sections.join('\n');
   return query ? editMenuMessage(query, text, navKeyboard()) : bot.sendMessage(chatId, text, { parse_mode: 'HTML' });
 }
 
