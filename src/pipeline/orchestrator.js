@@ -16,6 +16,8 @@ import { setDegenHandler } from '../signals/trending.js';
 import { setCandidateHandler } from '../signals/feeClaim.js';
 import { short } from '../format.js';
 import { escapeHtml } from '../format.js';
+import { evaluateBuyRisk } from '../risk/engine.js';
+import { REQUIRE_CONFIRMATION_FOR_LIVE } from '../config.js';
 
 export const seenSignalCandidates = new Map();
 
@@ -150,6 +152,47 @@ export async function handleApprovedBuy(selectedRow, decision, batchId, rows = [
     return;
   }
 
+  const risk = await evaluateBuyRisk({ candidate: freshSelectedRow.candidate, decision, mode, approved: false, side: 'buy' });
+  if (!risk.ok) {
+    updateCandidateStatus(freshSelectedRow.id, 'risk_rejected');
+    logDecisionEvent({
+      batchId,
+      triggerCandidateId,
+      selectedRow: freshSelectedRow,
+      rows: executionRows,
+      decision,
+      mode,
+      action: 'entry_rejected_risk_engine',
+      guardrails: risk,
+    });
+    await sendTelegram([
+      '🛡️ <b>Buy blocked by risk engine</b>',
+      '',
+      candidateSummary(freshSelectedRow.candidate, decision),
+      '',
+      `Risk score: <b>${risk.riskScore}</b>`,
+      `Blocks: ${escapeHtml(risk.blocks.map(item => item.message).join('; ') || 'none')}`,
+    ].join('\n'));
+    return;
+  }
+
+  if (mode === 'live' && REQUIRE_CONFIRMATION_FOR_LIVE) {
+    const intentId = createTradeIntent(freshSelectedRow.id, freshSelectedRow.candidate, decision, mode, 'pending_confirmation');
+    logDecisionEvent({
+      batchId,
+      triggerCandidateId,
+      selectedRow: freshSelectedRow,
+      rows: executionRows,
+      decision,
+      mode,
+      action: 'live_intent_created_confirmation_required',
+      guardrails: risk,
+      execution: { intentId },
+    });
+    await sendTradeIntent(intentId, freshSelectedRow.candidate, decision);
+    return;
+  }
+
   if (mode === 'dry_run') {
     const positionId = await createDryRunPosition(freshSelectedRow.id, freshSelectedRow.candidate, decision, `llm_batch_${batchId}`);
     logDecisionEvent({
@@ -160,7 +203,7 @@ export async function handleApprovedBuy(selectedRow, decision, batchId, rows = [
       decision,
       mode,
       action: 'dry_run_entry',
-      guardrails: { maxOpenPositions: numSetting('max_open_positions', 3), openPositions: openPositionCount() },
+      guardrails: risk,
       execution: { positionId },
     });
     await sendPositionOpen(positionId);

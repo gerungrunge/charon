@@ -1,7 +1,7 @@
 import { bot } from './bot.js';
-import { TELEGRAM_CHAT_ID } from '../config.js';
+import { TELEGRAM_CHAT_ID, DB_PATH, ENABLE_LLM, GMGN_ENABLED, ALLOW_LIVE_TRADING, REQUIRE_CONFIRMATION_FOR_LIVE } from '../config.js';
 import { now, json } from '../utils.js';
-import { escapeHtml, fmtPct, fmtSol } from '../format.js';
+import { escapeHtml, fmtPct } from '../format.js';
 import { db } from '../db/connection.js';
 import { numSetting, boolSetting, setSetting, activeStrategy, setActiveStrategy, strategyById, updateStrategyConfig } from '../db/settings.js';
 import { candidateById, latestCandidateByMint, updateCandidateStatus } from '../db/candidates.js';
@@ -25,16 +25,39 @@ import { sendTelegram, sendBatch, sendPositionOpen } from './send.js';
 import { candidateSummary, formatPosition } from './format.js';
 import { refreshPosition } from '../execution/positions.js';
 import { executeLiveSell } from '../execution/router.js';
+import { tradingMode, openPositionCount } from '../db/positions.js';
 import { handleCallback, editMenuMessage } from './callbacks.js';
 import { consumeNumericFilterInput } from './input.js';
 import { runLearning, sendLessons } from '../learning/commands.js';
 import { fetchWalletPnl } from '../enrichment/wallets.js';
+import { validateTelegramUser } from '../security/telegram.js';
+import { riskSummaryText } from '../risk/engine.js';
+import { addToBlacklist, removeFromBlacklist, listBlacklist } from '../risk/blacklist.js';
+import { executeConfirmedIntent, rejectIntent } from '../execution/router.js';
+import { getLastError } from '../observability/logger.js';
 
 export async function handleMessage(msg) {
+  if (!validateTelegramUser(msg)) return;
   const text = (msg.text || '').trim();
   const chatId = msg.chat.id;
   if (await consumeNumericFilterInput(chatId, text, msg.message_id)) return;
   if (!text.startsWith('/')) return;
+  if (text.startsWith('/start')) return bot.sendMessage(chatId, helpText(), { parse_mode: 'HTML', disable_web_page_preview: true });
+  if (text.startsWith('/help')) return bot.sendMessage(chatId, helpText(), { parse_mode: 'HTML', disable_web_page_preview: true });
+  if (text.startsWith('/status')) return sendStatus(chatId);
+  if (text.startsWith('/mode')) return bot.sendMessage(chatId, `Current mode: <b>${tradingMode()}</b>`, { parse_mode: 'HTML' });
+  if (text.startsWith('/setmode')) return setModeCommand(chatId, text);
+  if (text.startsWith('/risk')) return bot.sendMessage(chatId, riskSummaryText(), { parse_mode: 'HTML' });
+  if (text.startsWith('/settings')) return bot.sendMessage(chatId, `${agentText()}
+
+${riskSummaryText()}`, { parse_mode: 'HTML', disable_web_page_preview: true });
+  if (text.startsWith('/emergency_on')) { setSetting('emergency_stop', 'true'); return bot.sendMessage(chatId, '🛑 Emergency stop ON. New buys are blocked. Sells for risk reduction can still run.'); }
+  if (text.startsWith('/emergency_off')) { setSetting('emergency_stop', 'false'); return bot.sendMessage(chatId, '✅ Emergency stop OFF. Guardrails still apply.'); }
+  if (text.startsWith('/blacklist')) return blacklistCommand(chatId, text);
+  if (text.startsWith('/unblacklist')) return unblacklistCommand(chatId, text);
+  if (text.startsWith('/approve')) return approveRejectCommand(chatId, text, true);
+  if (text.startsWith('/reject')) return approveRejectCommand(chatId, text, false);
+  if (text.startsWith('/report')) return runLearning(chatId, text.split(/\s+/)[1] || '12h');
   if (text.startsWith('/menu')) return sendMenu(chatId);
   if (text.startsWith('/positions')) return sendPositions(chatId);
   if (text.startsWith('/filters')) return bot.sendMessage(chatId, filtersText(), { parse_mode: 'HTML' });
@@ -238,6 +261,20 @@ export async function toggleTrailing(chatId, id, query = null) {
 
 export function setupTelegram() {
   bot.setMyCommands([
+    { command: 'start', description: 'Start/help' },
+    { command: 'help', description: 'Show help' },
+    { command: 'status', description: 'Runtime and risk status' },
+    { command: 'mode', description: 'Show trading mode' },
+    { command: 'setmode', description: 'Set mode: dry_run/confirm/live' },
+    { command: 'risk', description: 'Show risk guardrails' },
+    { command: 'emergency_on', description: 'Block new buys' },
+    { command: 'emergency_off', description: 'Allow new buys again' },
+    { command: 'blacklist', description: 'Blacklist token mint' },
+    { command: 'unblacklist', description: 'Remove token blacklist' },
+    { command: 'approve', description: 'Approve pending trade intent' },
+    { command: 'reject', description: 'Reject pending trade intent' },
+    { command: 'settings', description: 'Show settings' },
+    { command: 'report', description: 'Run learning report' },
     { command: 'menu', description: 'Open Charon menu' },
     { command: 'strategy', description: 'Show/switch strategy' },
     { command: 'stratset', description: 'Set strategy config (stratset id key value)' },
@@ -253,15 +290,12 @@ export function setupTelegram() {
     { command: 'wallets', description: 'List saved wallets' },
   ]).catch(err => console.log(`[telegram] commands ${err.message}`));
 
-  bot.on('callback_query', query => handleCallback(query).catch(err => console.log(`[callback] ${err.message}`)));
-  bot.on('message', msg => handleMessage(msg).catch(err => console.log(`[message] ${err.message}`)));
-  bot.on('polling_error', err => {
-    console.log(`[telegram] polling ${err.message}`);
-    if (err.code === 'EFATAL') {
-      console.log('[telegram] EFATAL — restarting polling in 5s');
-      setTimeout(() => bot.startPolling().catch(e => console.log(`[telegram] restart failed: ${e.message}`)), 5000);
-    }
+  bot.on('callback_query', query => {
+    if (!validateTelegramUser(query.message)) return bot.answerCallbackQuery(query.id, { text: 'Unauthorized' }).catch(() => {});
+    return handleCallback(query).catch(err => console.log(`[callback] ${err.message}`));
   });
+  bot.on('message', msg => handleMessage(msg).catch(err => console.log(`[message] ${err.message}`)));
+  bot.on('polling_error', err => console.log(`[telegram] polling ${err.message}`));
 }
 
 async function sendMenu(chatId = TELEGRAM_CHAT_ID) {
@@ -275,58 +309,95 @@ async function sendMenu(chatId = TELEGRAM_CHAT_ID) {
 }
 
 async function sendPnl(chatId, query = null) {
-  const sections = [];
-
-  // --- Dry-run / sim PnL ---
-  const allPos = db.prepare('SELECT * FROM dry_run_positions ORDER BY opened_at_ms DESC').all();
-  const openPos = allPos.filter(p => p.status === 'open');
-  const closedPos = allPos.filter(p => p.status === 'closed');
-  const wins = closedPos.filter(p => Number(p.pnl_percent || 0) > 0);
-  const losses = closedPos.filter(p => Number(p.pnl_percent || 0) < 0);
-  const totalPnlSol = closedPos.reduce((s, p) => s + Number(p.pnl_sol || 0), 0);
-  const totalPnlPct = closedPos.reduce((s, p) => s + Number(p.pnl_percent || 0), 0);
-  const avgPnlPct = closedPos.length ? totalPnlPct / closedPos.length : 0;
-  const winRate = closedPos.length ? (wins.length / closedPos.length * 100) : 0;
-
-  const best = [...closedPos].sort((a, b) => Number(b.pnl_percent || 0) - Number(a.pnl_percent || 0))[0];
-  const worst = [...closedPos].sort((a, b) => Number(a.pnl_percent || 0) - Number(b.pnl_percent || 0))[0];
-
-  const simLines = [
-    '📊 <b>Dry-Run PnL</b>',
-    '',
-    `Open: <b>${openPos.length}</b> · Closed: <b>${closedPos.length}</b>`,
-    `Wins: <b>${wins.length}</b> · Losses: <b>${losses.length}</b> · Win rate: <b>${fmtPct(winRate)}</b>`,
-    `Total PnL: <b>${totalPnlSol >= 0 ? '+' : ''}${fmtSol(totalPnlSol)} SOL</b> (${fmtPct(totalPnlPct)})`,
-    `Avg PnL/trade: <b>${fmtPct(avgPnlPct)}</b>`,
-  ];
-  if (best) simLines.push(`Best: <b>${escapeHtml(best.symbol || best.mint?.slice(0, 8))}</b> ${fmtPct(best.pnl_percent)}`);
-  if (worst && worst !== best) simLines.push(`Worst: <b>${escapeHtml(worst.symbol || worst.mint?.slice(0, 8))}</b> ${fmtPct(worst.pnl_percent)}`);
-  if (!allPos.length) simLines.push('\n<i>No dry-run positions yet.</i>');
-  sections.push(simLines.join('\n'));
-
-  // --- On-chain wallet PnL ---
   const wallets = savedWallets();
-  if (wallets.length) {
-    const walletLines = ['', '👛 <b>Wallet PnL</b>'];
-    for (const wallet of wallets) {
-      const pnl = await fetchWalletPnl(wallet.address).catch(() => null);
-      if (!pnl) {
-        walletLines.push(`• <b>${escapeHtml(wallet.label)}</b>: no data`);
-        continue;
-      }
-      walletLines.push([
-        `• <b>${escapeHtml(wallet.label)}</b>`,
-        `  Win: ${fmtPct(pnl.winRate)} · PnL: ${fmtPct(pnl.totalPnlPercent)}`,
-        `  Trades: ${pnl.totalTrades} · Wins: ${pnl.wins}`,
-      ].join('\n'));
-    }
-    sections.push(walletLines.join('\n'));
-  } else {
-    sections.push('\n<i>💡 Tip: /walletadd &lt;label&gt; &lt;address&gt; to track on-chain PnL</i>');
+  if (!wallets.length) {
+    const text = '📊 <b>PnL</b>\n\nNo saved wallets. Use /walletadd &lt;label&gt; &lt;address&gt;.';
+    return query ? editMenuMessage(query, text, navKeyboard()) : bot.sendMessage(chatId, text, { parse_mode: 'HTML' });
   }
-
-  const text = sections.join('\n');
+  const chunks = [];
+  for (const wallet of wallets) {
+    const pnl = await fetchWalletPnl(wallet.address).catch(() => null);
+    if (!pnl) {
+      chunks.push(`• <b>${escapeHtml(wallet.label)}</b>: no data`);
+      continue;
+    }
+    chunks.push([
+      `• <b>${escapeHtml(wallet.label)}</b>`,
+      `Win: ${fmtPct(pnl.winRate)} · PnL: ${fmtPct(pnl.totalPnlPercent)}`,
+      `Trades: ${pnl.totalTrades} · Wins: ${pnl.wins}`,
+    ].join('\n'));
+  }
+  const text = `📊 <b>PnL</b>\n\n${chunks.join('\n\n')}`;
   return query ? editMenuMessage(query, text, navKeyboard()) : bot.sendMessage(chatId, text, { parse_mode: 'HTML' });
+}
+
+
+function helpText() {
+  return [
+    '🛶 <b>Charon</b>',
+    'Trading safety first. LLM recommends only; deterministic risk engine decides.',
+    '',
+    '<b>Core</b>: /status /mode /setmode dry_run|confirm|live /positions /pnl',
+    '<b>Risk</b>: /risk /emergency_on /emergency_off /blacklist &lt;mint&gt; /unblacklist &lt;mint&gt;',
+    '<b>Approval</b>: /approve &lt;id&gt; /reject &lt;id&gt;',
+    '<b>Learning</b>: /lessons /report',
+    '<b>Menu</b>: /menu /settings',
+  ].join('\n');
+}
+
+async function sendStatus(chatId) {
+  const uptime = Math.floor(process.uptime());
+  const lastSignal = db.prepare('SELECT MAX(at_ms) AS at FROM signal_events').get()?.at || null;
+  const stats = db.prepare("SELECT COUNT(*) AS count FROM dry_run_trades WHERE side = 'buy' AND at_ms >= ?").get(new Date(new Date().toISOString().slice(0, 10) + 'T00:00:00.000Z').getTime());
+  const pnl = db.prepare("SELECT COALESCE(SUM(pnl_sol), 0) AS pnl FROM dry_run_positions WHERE status = 'closed' AND closed_at_ms >= ?").get(new Date(new Date().toISOString().slice(0, 10) + 'T00:00:00.000Z').getTime());
+  const text = [
+    '📡 <b>Status</b>',
+    `Uptime: <b>${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m</b>`,
+    `Mode: <b>${tradingMode()}</b>`,
+    `ALLOW_LIVE_TRADING: <b>${ALLOW_LIVE_TRADING}</b>`,
+    `REQUIRE_CONFIRMATION_FOR_LIVE: <b>${REQUIRE_CONFIRMATION_FOR_LIVE}</b>`,
+    `Emergency stop: <b>${boolSetting('emergency_stop', false)}</b>`,
+    `Open positions: <b>${openPositionCount()}</b>`,
+    `Today trades: <b>${stats.count}</b>`,
+    `Today PnL: <b>${Number(pnl.pnl || 0).toFixed(4)} SOL</b>`,
+    `Last signal: <b>${lastSignal ? new Date(lastSignal).toISOString() : 'none'}</b>`,
+    `Last error: <code>${escapeHtml(getLastError() || 'none')}</code>`,
+    `DB path: <code>${escapeHtml(DB_PATH)}</code>`,
+    `LLM enabled: <b>${ENABLE_LLM}</b>`,
+    `GMGN enabled: <b>${GMGN_ENABLED}</b>`,
+  ].join('\n');
+  return bot.sendMessage(chatId, text, { parse_mode: 'HTML', disable_web_page_preview: true });
+}
+
+function setModeCommand(chatId, text) {
+  const mode = text.split(/\s+/)[1];
+  if (!['dry_run', 'confirm', 'live'].includes(mode)) return bot.sendMessage(chatId, 'Usage: /setmode dry_run|confirm|live');
+  setSetting('trading_mode', mode);
+  const warning = mode === 'live' && !ALLOW_LIVE_TRADING ? '\n⚠️ ALLOW_LIVE_TRADING=false, so risk engine will block live buys until .env is changed and app restarted.' : '';
+  return bot.sendMessage(chatId, `Mode set to <b>${mode}</b>${warning}`, { parse_mode: 'HTML' });
+}
+
+function blacklistCommand(chatId, text) {
+  const [, mint, ...reasonParts] = text.split(/\s+/);
+  if (!mint) {
+    const rows = listBlacklist(20);
+    return bot.sendMessage(chatId, rows.length ? rows.map(row => `• <code>${escapeHtml(row.mint)}</code> — ${escapeHtml(row.reason || '')}`).join('\n') : 'Blacklist is empty.', { parse_mode: 'HTML' });
+  }
+  addToBlacklist(mint, reasonParts.join(' ') || 'manual');
+  return bot.sendMessage(chatId, `Blacklisted <code>${escapeHtml(mint)}</code>.`, { parse_mode: 'HTML' });
+}
+
+function unblacklistCommand(chatId, text) {
+  const mint = text.split(/\s+/)[1];
+  if (!mint) return bot.sendMessage(chatId, 'Usage: /unblacklist <mint>');
+  removeFromBlacklist(mint);
+  return bot.sendMessage(chatId, `Removed <code>${escapeHtml(mint)}</code> from blacklist.`, { parse_mode: 'HTML' });
+}
+
+function approveRejectCommand(chatId, text, approve) {
+  const id = Number(text.split(/\s+/)[1]);
+  if (!Number.isInteger(id) || id <= 0) return bot.sendMessage(chatId, `Usage: /${approve ? 'approve' : 'reject'} <id>`);
+  return approve ? executeConfirmedIntent(chatId, id) : rejectIntent(chatId, id);
 }
 
 function parseSetFilter(text) {

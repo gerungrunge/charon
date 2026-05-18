@@ -13,9 +13,14 @@ import { bot } from '../telegram/bot.js';
 import { candidateSummary } from '../telegram/format.js';
 import { sendPositionOpen, sendTelegram } from '../telegram/send.js';
 import { updateCandidateStatus } from '../db/candidates.js';
-import { createTradeIntent } from '../db/intents.js';
+import { createTradeIntent, markApproval } from '../db/intents.js';
+import { evaluateBuyRisk } from '../risk/engine.js';
 
 export async function executeLiveBuy(selectedRow, decision, batchId, rows = [], triggerCandidateId = null) {
+  const preRisk = await evaluateBuyRisk({ candidate: selectedRow.candidate, decision, mode: 'live', approved: true, side: 'buy' });
+  if (!preRisk.ok) {
+    throw new Error(`Risk engine blocked live buy: ${preRisk.blocks.map(item => item.message).join('; ')}`);
+  }
   const strat = activeStrategy();
   const amountLamports = Math.floor((strat.position_size_sol ?? numSetting('dry_run_buy_sol', 0.1)) * 1_000_000_000);
   const balance = await liveWalletBalanceLamports();
@@ -77,6 +82,13 @@ export async function executeConfirmedIntent(chatId, intentId) {
         `Failures: ${escapeHtml((freshRow.candidate.filters?.failures || []).join('; ') || 'fresh execution guard failed')}`,
       ].join('\n'), { parse_mode: 'HTML', disable_web_page_preview: true });
     }
+    const approvedRisk = await evaluateBuyRisk({ candidate: freshRow.candidate, decision, mode: 'live', approved: true, side: 'buy' });
+    if (!approvedRisk.ok) {
+      db.prepare('UPDATE trade_intents SET status = ?, updated_at_ms = ? WHERE id = ?').run('rejected_risk_engine', now(), intentId);
+      markApproval(intentId, 'rejected');
+      return bot.sendMessage(chatId, `Risk engine blocked live buy: ${escapeHtml(approvedRisk.blocks.map(item => item.message).join('; '))}`, { parse_mode: 'HTML' });
+    }
+    markApproval(intentId, 'approved');
     const strat = activeStrategy();
     const amountLamports = Math.floor((strat.position_size_sol ?? numSetting('dry_run_buy_sol', 0.1)) * 1_000_000_000);
     const balance = await liveWalletBalanceLamports();
@@ -116,5 +128,6 @@ export async function rejectIntent(chatId, intentId) {
   const intent = intentById(intentId);
   if (!intent) return bot.sendMessage(chatId, 'Intent not found.');
   db.prepare('UPDATE trade_intents SET status = ?, updated_at_ms = ? WHERE id = ?').run('rejected', now(), intentId);
+  markApproval(intentId, 'rejected');
   return bot.sendMessage(chatId, `Rejected trade intent #${intentId}.`);
 }
